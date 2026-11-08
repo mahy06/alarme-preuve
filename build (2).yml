@@ -1,0 +1,133 @@
+name: Construire l'APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Installer Capacitor 6, le plugin et esbuild
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/local-notifications@6 esbuild@0.24
+
+      - name: Preparer la page web et empaqueter le plugin
+        run: |
+          mkdir -p www
+          cp index.html www/
+          cat > entry.js <<'EOT'
+          import { LocalNotifications } from '@capacitor/local-notifications';
+          window.LocalNotifications = LocalNotifications;
+          EOT
+          npx esbuild entry.js --bundle --format=iife --platform=browser --target=es2019 --outfile=www/plugins.js
+          ls -la www
+          cat > capacitor.config.json <<'EOT'
+          {"appId":"com.reveilmillions.app","appName":"Alarme Preuve","webDir":"www","plugins":{"LocalNotifications":{"sound":"alarme.wav"}}}
+          EOT
+          cat > patch.js <<'EOT'
+          // Prépare le projet Android avant la compilation :
+          // 1) ajoute les permissions utiles aux alarmes
+          // 2) crée la sonnerie (res/raw/alarme.wav) pour le canal « Alarmes »
+          const fs = require('fs');
+          const path = require('path');
+
+          // 1) Permissions (Android 14)
+          const chemin = 'android/app/src/main/AndroidManifest.xml';
+          let xml = fs.readFileSync(chemin, 'utf8');
+          const permissions = [
+            'POST_NOTIFICATIONS',     // afficher les notifications (Android 13+)
+            'USE_EXACT_ALARM',        // alarmes exactes, accordée à l'installation pour une app d'alarme
+            'RECEIVE_BOOT_COMPLETED', // reprogrammer les alarmes après un redémarrage
+            'VIBRATE'                 // vibration
+          ];
+          const lignes = permissions
+            .filter((p) => !xml.includes('android.permission.' + p))
+            .map((p) => '    <uses-permission android:name="android.permission.' + p + '" />')
+            .join('\n');
+          if (!xml.includes('<application')) throw new Error('Balise <application> introuvable');
+          if (lignes) xml = xml.replace('<application', lignes + '\n    <application');
+          fs.writeFileSync(chemin, xml);
+          console.log('Permissions OK');
+
+          // 2) Sonnerie : bips de 0,4 s toutes les 0,6 s pendant 10 secondes
+          const freq = 22050;
+          const secondes = 10;
+          const n = freq * secondes;
+          const donnees = Buffer.alloc(n * 2);
+          for (let i = 0; i < n; i++) {
+            const t = i / freq;
+            const c = t % 0.6;
+            const env = c < 0.4 ? Math.min(1, c / 0.02, (0.4 - c) / 0.02) : 0;
+            const v = Math.sin(2 * Math.PI * 880 * t) * env * 0.8;
+            donnees.writeInt16LE(Math.round(v * 32767), i * 2);
+          }
+          const h = Buffer.alloc(44);
+          h.write('RIFF', 0);
+          h.writeUInt32LE(36 + donnees.length, 4);
+          h.write('WAVE', 8);
+          h.write('fmt ', 12);
+          h.writeUInt32LE(16, 16);
+          h.writeUInt16LE(1, 20);
+          h.writeUInt16LE(1, 22);
+          h.writeUInt32LE(freq, 24);
+          h.writeUInt32LE(freq * 2, 28);
+          h.writeUInt16LE(2, 32);
+          h.writeUInt16LE(16, 34);
+          h.write('data', 36);
+          h.writeUInt32LE(donnees.length, 40);
+          const dossier = 'android/app/src/main/res/raw';
+          fs.mkdirSync(dossier, { recursive: true });
+          fs.writeFileSync(path.join(dossier, 'alarme.wav'), Buffer.concat([h, donnees]));
+          console.log('Sonnerie OK');
+          EOT
+
+      - name: Creer le projet Android
+        run: npx cap add android
+
+      - name: Permissions et sonnerie
+        run: node patch.js
+
+      - name: Synchroniser
+        run: npx cap sync android
+
+      - name: Compiler l'APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Renommer l'APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk alarme-preuve.apk
+
+      - name: Controler l'APK (informatif)
+        continue-on-error: true
+        run: |
+          ls -la alarme-preuve.apk
+          unzip -l alarme-preuve.apk | grep -i "raw/alarme" || echo "ATTENTION : alarme.wav introuvable dans l'APK"
+          unzip -p alarme-preuve.apk assets/public/plugins.js | head -c 300 || echo "ATTENTION : plugins.js introuvable"
+          AAPT2=$(ls $ANDROID_HOME/build-tools/*/aapt2 | sort -V | tail -1)
+          $AAPT2 dump permissions alarme-preuve.apk
+
+      - name: Publier l'APK dans Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Version ${{ github.run_number }}
+          files: alarme-preuve.apk
